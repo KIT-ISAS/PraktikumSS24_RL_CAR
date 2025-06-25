@@ -16,6 +16,9 @@ class RCCarNavigationEnv(gym.Env):
         self.goal_hold_timer = 0
         self.goal_reached = False
 
+        self.steering_hold_counter = 0
+        self.prev_steering = 0.0
+
         self.observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf, shape=(6,), dtype=np.float32
         )
@@ -40,6 +43,8 @@ class RCCarNavigationEnv(gym.Env):
         self.prev_v_sign = 1
         self.steps = 0
         self.v_switches = 0
+        self.prev_steering = 0.0
+        self.steering_hold_counter = 0
 
         self.goal_hold_timer = 0
         self.goal_reached = False
@@ -66,30 +71,43 @@ class RCCarNavigationEnv(gym.Env):
         obs = self._get_obs()
         reward = self._compute_reward()
 
-        # Zielverhalten
+        # === Zielverhalten ===
         dist_to_goal = np.linalg.norm(self.goal - self.position)
         goal_radius = 0.2
+        goal_reached_now = False
 
         if dist_to_goal < goal_radius:
             self.goal_hold_timer += 1
-            if self.goal_hold_timer >= self.goal_hold_duration:
+            if self.goal_hold_timer == self.goal_hold_duration:
+                reward += 100.0  # Ziel erfolgreich erreicht
+                goal_reached_now = True
                 self.goal = self._sample_goal()
                 self.goal_hold_timer = 0
-                reward += 100.0  # Ziel erfolgreich erreicht
         else:
             self.goal_hold_timer = 0
 
         # === Rand überschreiten – sehr starke Strafe ===
         out_of_bounds = np.any(np.abs(self.position) > self.area_size / 2)
         if out_of_bounds:
-            reward -= 100.0  # massiv bestrafen
-            truncated = True  # Episode beenden
+            reward -= 100.0
+            truncated = True
         else:
             truncated = self.steps >= self.max_episode_steps
 
+        # === Lenkwinkel-Halte-Strafe ===
+        if abs(steering - self.prev_steering) < 0.01:
+            self.steering_hold_counter += 1
+        else:
+            self.steering_hold_counter = 0
+
+        if self.steering_hold_counter > 30:
+            reward -= 2.0  # Strafe für zu lang gleiches Lenken
+
+        self.prev_steering = steering
+
         terminated = False
         self.steps += 1
-        return obs, reward, terminated, truncated, {}
+        return obs, reward, terminated, truncated, {"goal_reached": goal_reached_now}
 
     def _get_obs(self):
         dx, dy = self.goal - self.position

@@ -1,3 +1,4 @@
+# DDPG Agent for RCCar Navigation with Pygame Visualization
 import pygame
 import numpy as np
 import torch
@@ -133,7 +134,7 @@ def main():
 
     # === Laden gespeicherter Modelle ===
     try:
-        actor.load_state_dict(torch.load("actor_100000.pth"))
+        actor.load_state_dict(torch.load("actor_200000.pth"))
         print("Model loaded.")
     except FileNotFoundError:
         print("No saved model found. Starting from scratch.")
