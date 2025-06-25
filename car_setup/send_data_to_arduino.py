@@ -10,8 +10,7 @@ class Server:
     def __init__(self):
         # Serielle Verbindung mit Arduino
         try:
-            self.ser = serial.Serial('/dev/ttyACM1', 9600, timeout=1)
-            time.sleep(2)  # Arduino-Reset abwarten
+            self.ser = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
             print("Serielle Verbindung zum Arduino geöffnet.")
         except serial.SerialException as e:
             print(f"Fehler bei serieller Verbindung: {e}")

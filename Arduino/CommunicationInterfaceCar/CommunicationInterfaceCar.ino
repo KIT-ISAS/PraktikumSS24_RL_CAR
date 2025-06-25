@@ -1,4 +1,5 @@
 #include <SPI.h>
+#include <ArduinoJson.h>
 
 // === Pinbelegung === 
 const int controller_Speed_Input = A0;
@@ -21,11 +22,11 @@ bool useAutonomous = false;
 void setup() {
   pinMode(DAC_CS_Pin, OUTPUT);
   pinMode(buttonInput, INPUT);
-  
+
   SPI.begin();
   digitalWrite(DAC_CS_Pin, HIGH);
 
-  Serial.begin(9600);
+  Serial.begin(115200);  // ← schnellere Übertragung
   Serial.println("System bereit. Warte auf Moduswahl ...");
 }
 
@@ -42,58 +43,55 @@ void loop() {
   }
   lastButtonState = currentButtonState;
 
-  // === Seriellen Input lesen
+  // === Seriellen JSON-Input lesen (vom Pi)
   if (Serial.available()) {
     String input = Serial.readStringUntil('\n');
-    int commaIndex = input.indexOf(',');
-    if (commaIndex > 0) {
-      String sStr = input.substring(0, commaIndex);       // Speed
-      String vStr = input.substring(commaIndex + 1);      // Steering
-      float s = sStr.toFloat();
-      float v = vStr.toFloat();
-      if ((s != 0.0 || sStr.startsWith("0")) && (v != 0.0 || vStr.startsWith("0"))) {
-        speedV = s;
-        steeringV = v;
-      }
+    StaticJsonDocument<100> doc;
+    DeserializationError err = deserializeJson(doc, input);
+    if (!err) {
+      float s = doc["speed"];
+      float v = doc["steering"];
+      // Skaliere von -1 .. 1 → 0 .. 3 V
+      speedV = constrain((s + 1.0) * 1.5, 1.3, 1.7);     // Nur speed begrenzen!
+      steeringV = (v + 1.0) * 1.5;
+    } else {
+      Serial.println("JSON-Parsing-Fehler");
     }
   }
 
-  float effectiveSteeringV, effectiveSpeedV;
+  float effSteeringV, effSpeedV;
 
   if (useAutonomous) {
-    // Nur Speed begrenzen
-    effectiveSteeringV = steeringV;
-    effectiveSpeedV = constrain(speedV, 1.3, 1.7);
+    effSteeringV = steeringV;
+    effSpeedV = speedV;
     Serial.print("Python vorgabe: ");
-    Serial.print(effectiveSteeringV);
+    Serial.print(effSteeringV);
     Serial.print(" / ");
-    Serial.println(effectiveSpeedV);
+    Serial.println(effSpeedV);
   } else {
-    effectiveSteeringV = analogRead(controller_Steering_Input) * (5.0 / 1023.0);
-    effectiveSpeedV = analogRead(controller_Speed_Input) * (5.0 / 1023.0);
+    effSteeringV = analogRead(controller_Steering_Input) * (5.0 / 1023.0);
+    effSpeedV = analogRead(controller_Speed_Input) * (5.0 / 1023.0);
   }
 
   // DAC darf nur bis 3.0 V ausgeben
-  effectiveSteeringV = constrain(effectiveSteeringV, 0.0, 3.0);
-  effectiveSpeedV = constrain(effectiveSpeedV, 0.0, 3.0);
+  effSteeringV = constrain(effSteeringV, 0.0, 3.0);
+  effSpeedV = constrain(effSpeedV, 0.0, 3.0);
 
-  // Umrechnung auf 12-bit DAC-Wert (0–4095)
-  int dacSteering = (effectiveSteeringV / 3.0) * 4095.0;
-  int dacSpeed = (effectiveSpeedV / 3.0) * 4095.0;
+  // DAC-Werte berechnen
+  int dacSteering = (effSteeringV / 3.0) * 4095.0;
+  int dacSpeed = (effSpeedV / 3.0) * 4095.0;
 
-  // Ausgabe an DAC
+  // DAC-Ausgabe
   writeMCP4922(0, dacSteering);  // VOUTA = Steering
   writeMCP4922(1, dacSpeed);     // VOUTB = Speed
 
   // Debug
   Serial.print("Steering V: ");
-  Serial.print(effectiveSteeringV, 2);
+  Serial.print(effSteeringV, 2);
   Serial.print("\tSpeed V: ");
-  Serial.print(effectiveSpeedV, 2);
+  Serial.print(effSpeedV, 2);
   Serial.print("\tModus: ");
   Serial.println(useAutonomous ? "AUTONOM" : "RC");
-
-  delay(50);
 }
 
 void writeMCP4922(byte channel, int value) {
