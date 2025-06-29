@@ -35,7 +35,8 @@ class Client:
         self.line, = self.ax.plot([], [], lw=2)
         self.ani = animation.FuncAnimation(self.fig, self.update_plot, interval=100)
 
-        self.goal = np.array([-0.3, -0.3])  # Fixes Ziel
+        self.goal = np.array([-0.3, -0.3])      # Fixes Ziel
+        self.goal_reached = False               # Zustand merken
         self.send_loop()
 
     def send_loop(self):
@@ -59,7 +60,8 @@ class Client:
                 angle_to_goal = np.arctan2(dy, dx)
                 rel_angle = np.arctan2(np.sin(angle_to_goal - yaw), np.cos(angle_to_goal - yaw))
 
-                min_working_speed = 0.9
+                min_working_speed = 0.85
+                max_speed = 0.9
                 max_steering = 0.6
 
                 # === Spielfeld-Grenzen prüfen ===
@@ -68,16 +70,21 @@ class Client:
                     speed = 0.0
                     steering = 0.0
 
+                elif self.goal_reached:
+                    speed = 0.0
+                    steering = 0.0
+
                 elif distance < 0.1:
                     speed = 0.0
                     steering = 0.0
-                    print("\n🎯 Ziel erreicht.")
+                    self.goal_reached = True
+                    print("\n🎯 Ziel erreicht. Stoppe dauerhaft.")
 
                 else:
-                    speed = min_working_speed
+                    speed = min(min_working_speed, max_speed)
 
                     # Adaptive Lenkung: sanfter je näher am Ziel
-                    steering_gain = min(1.0, distance / 1.5)  # Skaliert mit Entfernung
+                    steering_gain = min(1.0, distance / 1.5)
                     steering = np.clip(steering_gain * rel_angle, -max_steering, max_steering)
 
                 # === Nachricht senden ===
