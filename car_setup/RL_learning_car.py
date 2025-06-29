@@ -69,11 +69,18 @@ class RewardEvaluator:
         if abs(v) < 0.01 and dist_to_goal > 0.2:
             reward -= 1.5
 
+        # ⛔ Bestrafung für Rückwärtsfahrt
         if v < -0.1:
             reward -= 1.0
+        # ✅ Bonus für Vorwärtsfahrt
         elif v > 0.1:
             reward += 1.0
 
+        # ✅ NEU: Zielgeschwindigkeit ("Goldilocks-Zone")
+        if 0.3 < v < 1.0:
+            reward += 20.0  # Belohnung für ideale Geschwindigkeit
+
+        # 🎯 Belohnung bei Zielerreichung mit geringer Geschwindigkeit
         if dist_to_goal < 0.2 and abs(v) < 0.1:
             reward += 5.0
 
@@ -159,6 +166,7 @@ class Client:
                 with torch.no_grad():
                     action = actor(state_tensor).cpu().numpy()[0]
                 speed, steering = action
+                speed = speed +0.6
 
                 reward = self.reward_calc.compute_reward(np.array([x, y]), yaw, v)
 
@@ -189,7 +197,7 @@ class Client:
                 }
                 data_log.append(entry)
 
-                print(f"\rPos: ({x:.2f}, {y:.2f}) | V: {v:.2f} | R: {reward:.2f} | G: {self.goal}", end="")
+                print(f"\rPos: ({x:.2f}, {y:.2f}) | V: {v:.2f} | R: {reward:.2f} | G: {self.goal} |  Speed and Steering: ({speed:.2f}, {steering:.2f})", end="")
                 self.plot_position(x, y)
 
                 sleep_time = self.interval - (time.time() - start)
