@@ -22,6 +22,7 @@ TAU = 0.005
 BUFFER_SIZE = 100000
 BATCH_SIZE = 128
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(DEVICE)
 
 # === Netzwerke ===
 class Actor(nn.Module):
@@ -77,6 +78,9 @@ class Client:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect((host, port))
 
+        self.fristIteration = True
+        self.counterZero = 0
+
         self.interval = 1 / 50
         self.goal = self._sample_goal()
         self.goal_start_time = time.time()
@@ -129,47 +133,67 @@ class Client:
         return (a - b + 180) % 360 - 180
 
     def _compute_reward(self, position, theta, v):
-        dist = np.linalg.norm(self.goal - position)
+        dist = np.linalg.norm(self.goal - position)  # Abstand zum Ziel
         reward = 0.0
 
+        # === 📈 Positive Rewards ===
+
+        # Belohnung für Annäherung ans Ziel seit dem letzten Schritt
         if self.prev_dist is not None:
             delta = self.prev_dist - dist
             if delta > 0:
-                reward += delta * 15.0  # sehr starke Belohnung für Annäherung
+                reward += delta * 8.0  # starke Belohnung für Annäherung
             else:
-                reward -= delta * 500.0  # dreifach bestraft fürs Entfernen
+                reward -= delta * 10.0  # starke Strafe fürs Entfernen
         self.prev_dist = dist
 
-        reward += (1.5 - dist) * 2.0
+        # Leichte Belohnung je näher man dem Ziel kommt (kontinuierlich)
+        # reward += (1.5 - dist) * 10.0
 
-        if abs(v) < 0.01 and dist > 0.2:
-            reward -= 1.5
-        if v < -0.1:
-            reward -= 1.0
-        elif v > 0.1:
-            reward += 1.0
+        # Belohnung für Vorwärtsfahrt
+        if v > 0.1:
+            reward += 2.0
+
+        # Belohnung für das Verweilen in Zielnähe bei niedriger Geschwindigkeit
         if dist < 0.3 and abs(v) < 0.7:
-            reward += 50.0
+            reward += 10.0  # sehr hohe Belohnung
         elif dist < 0.3 and abs(v) < 0.9:
-            reward += 10.0
+            reward += 5.0  # mittlere Belohnung
 
+        # === 📉 Negative Rewards ===
+
+        # Bestrafung für Stillstand, wenn noch weit vom Ziel entfernt
+        if abs(v) < 0.01 and dist > 0.4:
+            reward -= 2
+
+        # Bestrafung für Rückwärtsfahrt
+        if v < -0.1:
+            reward -= 2.0
+
+        # Bestrafung für Richtungswechsel mit Geschwindigkeit
         sign = np.sign(v)
-        if sign != self.prev_v_sign and abs(v) > 0.1:
+        if sign != self.prev_v_sign and abs(v) > 0.9:
             self.v_switches += 1
-            reward -= 5.0
+            reward -= 1.0
         self.prev_v_sign = sign
+
+        # Bestrafung für zu viele Richtungswechsel
         if self.v_switches >= 5:
-            reward -= 10.0
+            reward -= 2.0
             self.v_switches = 0
 
-        angle_diff = abs(theta - self.prev_theta)
-        move_diff = np.linalg.norm(position - self.prev_position)
-        if angle_diff > 0.3 and move_diff < 0.05:
+        # Bestrafung für starke Drehung ohne Positionsveränderung
+        steering_diff = abs(theta - self.prev_theta)
+        if steering_diff < 0.5:
             reward -= 3.0
 
+        # Bestrafung für Pausenzustand (z. B. bei Spielfeld verlassen)
         if self.paused:
-            reward -= 2000.0
+            reward -= 500.0  # sehr starke Bestrafung
 
+        reward -= abs(theta) * 1000
+
+        '''# Bestrafung für dauerhaft gleiches Lenken
         if self.last_steering is not None and abs(self.last_steering - self.current_steering) < 0.3:
             self.same_steering_count += 1
             if self.same_steering_count > 10:
@@ -178,14 +202,16 @@ class Client:
             self.same_steering_count = 0
         self.last_steering = self.current_steering
 
+        # Bestrafung für dauerhaft gleiche Geschwindigkeit
         if self.last_speed is not None and abs(self.last_speed - v) < 0.15:
             self.same_speed_count += 1
             if self.same_speed_count > 3:
                 reward -= 20.0
         else:
             self.same_speed_count = 0
-        self.last_speed = v
+        self.last_speed = v'''
 
+        # === 🧠 Zustände aktualisieren ===
         self.prev_theta = theta
         self.prev_position = position.copy()
 
@@ -194,18 +220,17 @@ class Client:
     def send_speed_message(self, speed, steering):
         current_sign = np.sign(speed)
 
-        if current_sign != 0 and current_sign != self.prev_speed_sign:
+        if current_sign != 0 and current_sign != self.prev_speed_sign and not self.paused:
             print("\n⏹️ Richtungswechsel erkannt – sende 0-Signale.")
             self.in_neutral_phase = True
             self.neutral_count = 0
             self.prev_speed_sign = current_sign
 
         if self.in_neutral_phase:
-            if self.neutral_count < 15:
+            if self.neutral_count < 5:
                 neutral = json.dumps({"speed": 0.0, "steering": 0.0}) + "\n"
                 self.sock.sendall(neutral.encode())
                 self.neutral_count += 1
-                time.sleep(0.02)
                 return
             else:
                 self.in_neutral_phase = False
@@ -239,6 +264,7 @@ class Client:
                     self.state = "orienting"
                     self.goal_hold_start = None
 
+                #RÜCKFÜHRUNG
                 if self.paused:
                     dx = self.return_goal[0] - x
                     dy = self.return_goal[1] - y
@@ -248,8 +274,9 @@ class Client:
                     goal_angle = np.degrees(np.arctan2(dy, dx)) % 360
                     angle_diff = (goal_angle - car_angle + 540) % 360 - 180
                     orientation_threshold = 3
+                    time.sleep(0.02)
 
-                    if distance < 0.45:
+                    if distance < 0.4:
                         speed = steering = 0.0
                         self.paused = False
                         self.prev_obs = None
@@ -257,17 +284,15 @@ class Client:
                     else:
                         if self.state == "orienting":
                             if abs(angle_diff) < orientation_threshold:
-                                speed = 0.85
+                                speed = 0.95
                                 steering = 0.0
-                                self.state = "moving"
                             else:
                                 speed = 0.85
                                 damb = angle_diff / 180.0
                                 steering = -damb * 1.8
-                        else:
-                            speed = 0.85
-                            steering = 0.0
-                else:
+                # RL-Learning
+                elif self.paused == False:
+                    self.fristIteration = True
                     dx, dy = self.goal[0] - x, self.goal[1] - y
                     dist = np.linalg.norm([dx, dy])
                     car_angle = (-yaw - 150) % 360
@@ -284,7 +309,7 @@ class Client:
                     speed, steering = action
                     self.current_steering = steering
 
-                    reward = self._compute_reward(position, yaw, speed)
+                    reward = self._compute_reward(position, steering, speed)
                     next_obs = state.copy()
                     done = False
 
@@ -329,7 +354,7 @@ class Client:
 
                 self.send_speed_message(speed, steering)
                 print(f"\rPos: ({x:.2f}, {y:.2f}) | Ziel: ({self.goal[0]:.2f}, {self.goal[1]:.2f}) | Speed: {speed:.2f}, Steering: {steering:.2f}| R: ({reward:.2f})", end="")
-                time.sleep(max(0, self.interval - (time.time() - start)))
+                # time.sleep(max(0, self.interval - (time.time() - start)))
 
         except KeyboardInterrupt:
             print("\n🛑 Stoppe...")
@@ -357,6 +382,19 @@ def start_live_plot(client_instance):
 
     ani = animation.FuncAnimation(fig, update_plot, interval=100, cache_frame_data=False)
     plt.show()
+
+'''if __name__ == "__main__":
+    client = Client()
+    send_thread = threading.Thread(target=client.send_loop, daemon=True)
+    send_thread.start()
+
+    # Endlosschleife hält das Hauptprogramm am Leben – ohne sleep()
+    try:
+        while True:
+            pass
+    except KeyboardInterrupt:
+        print("\nProgramm manuell gestoppt.")'''
+
 
 if __name__ == "__main__":
     client = Client()
