@@ -79,14 +79,18 @@ def compute_reward(position, goal, prev_dist, speed, steering, holding=False):
     dist = np.linalg.norm(goal - position)
     reward = 0.0
 
-    if holding:
-        return 15.0, dist
+    if holding == True:
+        print('in holding')
+        reward += 100
 
+    reward += 3 /dist
+    reward -= abs(position[0]) * 3
+    reward -= abs(position[1]) * 3
     if dist > 0.3 and abs(speed) < 0.7:
         reward -= 5.0
     if prev_dist is not None:
         progress = prev_dist - dist
-        reward += progress * 10.0
+        reward += progress * 5.0 / dist
         if progress < 0:
             reward -= 2.0
     if dist < 0.3 and abs(speed) < 0.1 and abs(steering) < 0.1:
@@ -95,8 +99,8 @@ def compute_reward(position, goal, prev_dist, speed, steering, holding=False):
         reward -= 2.0
     if abs(speed) < 0.05 and dist > 0.5:
         reward -= 1.0
-    if abs(steering) > 0.6:
-        reward -= abs(steering) * 2.0
+    if abs(steering) > 0.9:
+        reward -= abs(steering)
 
     return np.clip(reward, -10.0, 10.0), dist
 
@@ -139,6 +143,8 @@ class Client:
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.data_log_filename = f"plot_results/measurement_data/episode_{self.episode}_{timestamp_str}.json"
         os.makedirs(os.path.dirname(self.data_log_filename), exist_ok=True)
+
+        self.out_of_bounds_handled = False
 
     def _sample_goal(self):
         while True:
@@ -202,13 +208,43 @@ class Client:
                     speed_calculated = 0.0
                 prev_x, prev_y, prev_time = x, y, timestamp
 
-                # Spielfeldbegrenzung prüfen
-                if not (FIELD_X_LIMITS[0] <= x <= FIELD_X_LIMITS[1] and FIELD_Y_LIMITS[0] <= y <= FIELD_Y_LIMITS[1]):
-                    print("\n⛔ Spielfeld verlassen – Rueckfuehrung aktiviert.")
-                    self.paused = True
-                    self.state = "orienting"
+                # Nur bestrafen, wenn wir *noch nicht* in der Rückführung sind
+                # Nur einmal bestrafen, wenn noch nicht gehandelt
+                if not self.paused and not self.out_of_bounds_handled and not (
+                        FIELD_X_LIMITS[0] <= x <= FIELD_X_LIMITS[1] and FIELD_Y_LIMITS[0] <= y <= FIELD_Y_LIMITS[1]
+                ):
+                    print("\n⛔ Spielfeld verlassen – Bestrafung + Rückführung aktiviert.")
+                    reward, _ = compute_reward(position, self.goal, self.prev_dist, speed_calculated, steering, holding=False)
+                    done = True
+                    next_state = self.prev_obs if self.prev_obs is not None else state
+
+                    if self.prev_obs is not None:
+                        self.buffer.push((self.prev_obs, [0.0, 0.0], reward, next_state, 1.0))
+
+                    self.loss_log.append({
+                        "episode": self.episode,
+                        "critic_loss": self.loss_log[-1]["critic_loss"] if self.loss_log else 0.0,
+                        "actor_loss": self.loss_log[-1]["actor_loss"] if self.loss_log else 0.0,
+                        "reward": reward,
+                        "timestamp": time.time()
+                    })
+
+                    self.save_raw_data()
+                    self.raw_data_log = []
+                    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    self.data_log_filename = f"plot_results/measurement_data/episode_{self.episode}_{timestamp_str}.json"
+
+                    self.prev_obs = None
+                    self.prev_dist = None
                     self.goal_reached_time = None
                     self.hold_timer_active = False
+
+                    self.save_models()
+
+                    self.paused = True
+                    self.state = "orienting"
+                    self.out_of_bounds_handled = True  # Verhindert Wiederholung
+                    continue
 
                 # Rückführlogik
                 if self.paused:
@@ -227,6 +263,7 @@ class Client:
                         self.paused = False
                         self.prev_obs = None
                         self.goal_start_time = time.time()
+                        self.out_of_bounds_handled = False  # Flag zurücksetzen für nächste Runde
                         continue
                     else:
                         if self.state == "orienting":
@@ -268,7 +305,7 @@ class Client:
                 reward, current_dist = compute_reward(position, self.goal, self.prev_dist, speed, steering)
                 self.prev_dist = current_dist
                 next_state = state.copy()
-                done = current_dist < 0.2 or (time.time() - self.goal_start_time) > 45
+                done = current_dist < 0.2
 
                 if self.prev_obs is not None:
                     self.buffer.push((self.prev_obs, action, reward, next_state, float(done)))
@@ -296,6 +333,7 @@ class Client:
                     self.train_step()
 
                 self.send_speed_message(speed, steering)
+                print(f"\r[STATUS] Pos: ({position[0]:.2f}, {position[1]:.2f}) | Ziel: ({self.goal[0]:.2f}, {self.goal[1]:.2f}) | Distanz: {current_dist:.3f} | Done: {done}", end="", flush=True)
 
                 # Ziel erreicht
                 if done:
@@ -304,8 +342,17 @@ class Client:
                         self.hold_timer_active = True
                     elif time.time() - self.goal_reached_time >= 0.5:
                         print("\n✅ Ziel erreicht und gehalten.")
-                        reward, _ = compute_reward(position, self.goal, self.prev_dist, 0.0, 0.0, holding=True)
-                        self.buffer.push((self.prev_obs, [0.0, 0.0], reward, next_state, 1.0))
+                        reward = 10
+                        if self.prev_obs is not None:
+                            self.buffer.push((self.prev_obs, [0.0, 0.0], reward, next_state, 1.0))
+
+                        self.loss_log.append({
+                            "episode": self.episode,
+                            "critic_loss": self.loss_log[-1]["critic_loss"] if self.loss_log else 0.0,
+                            "actor_loss": self.loss_log[-1]["actor_loss"] if self.loss_log else 0.0,
+                            "reward": reward,
+                            "timestamp": time.time()
+                        })
                         self.save_raw_data()
                         self.raw_data_log = []
                         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -359,6 +406,7 @@ class Client:
             tp.data.copy_(TAU * p.data + (1 - TAU) * tp.data)
 
         self.loss_log.append({
+            "timestamp": time.time(),
             "episode": self.episode,
             "critic_loss": critic_loss.item(),
             "actor_loss": actor_loss.item(),
@@ -415,14 +463,14 @@ def start_live_plot(client_instance):
             car_dot.set_data([float(pos[0])], [float(pos[1])])
             goal_dot.set_data([float(goal[0])], [float(goal[1])])
 
-        episodes = [entry["episode"] for entry in client_instance.loss_log]
+        timestamps = [entry["timestamp"] - client_instance.loss_log[0]["timestamp"] for entry in client_instance.loss_log]
         critic_losses = [entry["critic_loss"] for entry in client_instance.loss_log]
         actor_losses = [entry["actor_loss"] for entry in client_instance.loss_log]
         rewards = [entry["reward"] for entry in client_instance.loss_log]
 
-        critic_line.set_data(episodes, critic_losses)
-        actor_line.set_data(episodes, actor_losses)
-        reward_line.set_data(episodes, rewards)
+        critic_line.set_data(timestamps, critic_losses)
+        actor_line.set_data(timestamps, actor_losses)
+        reward_line.set_data(timestamps, rewards)
 
         for ax in [ax_critic, ax_actor, ax_reward]:
             ax.relim()
