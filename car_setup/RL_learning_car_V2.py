@@ -1,4 +1,4 @@
-# === Verbesserter DDPG RL-Agent mit Rückführung und optimiertem Verhalten ===
+# === DDPG Reinforcement Learning Agent für Autonomes Fahrzeug mit wissenschaftlichem Logging und Rückführung ===
 
 import torch
 import torch.nn as nn
@@ -13,16 +13,20 @@ from collections import deque
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import threading
+import os
+from datetime import datetime
 
 # === Hyperparameter ===
-LR_ACTOR = 1e-3
+LR_ACTOR = 1e-4
 LR_CRITIC = 1e-3
 GAMMA = 0.99
-TAU = 0.01
-BUFFER_SIZE = 800_000
-BATCH_SIZE = 128
-SAVE_INTERVAL = 1000
+TAU = 0.005
+BUFFER_SIZE = 1_000_000
+BATCH_SIZE = 256
+TRAIN_INTERVAL = 10
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+FIELD_X_LIMITS = (-1.5, 1.5)
+FIELD_Y_LIMITS = (-1.5, 1.5)
 
 # === Modelle ===
 class Actor(nn.Module):
@@ -70,30 +74,23 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
-def save_models(actor, critic, episode):
-    torch.save(actor.state_dict(), f"actor_episode_{episode}.pth")
-    torch.save(critic.state_dict(), f"critic_episode_{episode}.pth")
-    print(f"\n💾 Modelle gespeichert (Episode {episode})")
-
-def compute_reward(position, goal, prev_dist, speed, steering):
+# === Reward-Funktion ===
+def compute_reward(position, goal, prev_dist, speed, steering, holding=False):
     dist = np.linalg.norm(goal - position)
     reward = 0.0
 
-    # Strafe fürs Stehenbleiben fern vom Ziel
-    if dist > 0.3 and abs(speed) < 0.7:
-        reward -= 5.0  # Deutliche Strafe fürs Nichtstun
+    if holding:
+        return 15.0, dist
 
+    if dist > 0.3 and abs(speed) < 0.7:
+        reward -= 5.0
     if prev_dist is not None:
         progress = prev_dist - dist
         reward += progress * 10.0
         if progress < 0:
             reward -= 2.0
-
-   # reward += max(0, (1.5 - dist)) * 10.0
-
     if dist < 0.3 and abs(speed) < 0.1 and abs(steering) < 0.1:
         reward += 10.0
-
     if speed < -0.1:
         reward -= 2.0
     if abs(speed) < 0.05 and dist > 0.5:
@@ -101,8 +98,9 @@ def compute_reward(position, goal, prev_dist, speed, steering):
     if abs(steering) > 0.6:
         reward -= abs(steering) * 2.0
 
-    return reward, dist
-# === Client-Klasse ===
+    return np.clip(reward, -10.0, 10.0), dist
+
+# === Platzhalter für Client-Klasse ===
 class Client:
     def __init__(self, host="192.168.137.5", port=12345):
         self.vr = triad_openvr.triad_openvr()
@@ -121,27 +119,44 @@ class Client:
 
         self.buffer = ReplayBuffer(BUFFER_SIZE)
         self.episode = 0
+        self.iteration = 0
+        self.loss_log = []
         self.prev_obs = None
         self.prev_dist = None
         self.goal = self._sample_goal()
-        self.goal_start_time = time.time()
-
-        self.prev_speed_sign = 1
-        self.in_neutral_phase = False
-        self.neutral_count = 0
+        self.return_goal = np.array([0.0, 0.0])
+        self.paused = False
+        self.state = "orienting"
+        self.prev_reward = 0.0
         self.current_position = np.array([0.0, 0.0])
         self.current_goal = self.goal
 
-        self.paused = False
-        self.state = "orienting"
-        self.return_goal = np.array([-0.3, -0.3])
-        self.exploration_noise = 0.2
+        self.prev_speed_sign = 0
+        self.in_neutral_phase = False
+        self.neutral_count = 0
+
+        self.raw_data_log = []
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.data_log_filename = f"plot_results/measurement_data/episode_{self.episode}_{timestamp_str}.json"
+        os.makedirs(os.path.dirname(self.data_log_filename), exist_ok=True)
 
     def _sample_goal(self):
         while True:
             g = np.random.uniform(-1.0, 1.0, size=2)
             if np.linalg.norm(g) > 0.5:
                 return g
+
+    def save_models(self):
+        os.makedirs("models", exist_ok=True)
+        torch.save(self.actor.state_dict(), f"models/actor_ep{self.episode}.pt")
+        torch.save(self.critic.state_dict(), f"models/critic_ep{self.episode}.pt")
+        print("💾 Modelle gespeichert.")
+
+    def save_logs(self):
+        os.makedirs("plot_results/loss_logs", exist_ok=True)
+        with open(f"plot_results/loss_logs/loss_log_ep{self.episode}.json", "w") as f:
+            json.dump(self.loss_log, f, indent=2)
+            print("📝 Loss-Log gespeichert.")
 
     def send_speed_message(self, speed, steering):
         current_sign = np.sign(speed)
@@ -167,21 +182,35 @@ class Client:
             self.goal_start_time = time.time()
             self.goal_reached_time = None
             self.hold_timer_active = False
+            prev_x = prev_y = prev_time = None
 
             while True:
                 pose = self.vr.devices["tracker_2"].get_pose_euler()
                 x, y, yaw = pose[0], pose[1], pose[3]
+                timestamp = time.time()
                 position = np.array([x, y])
                 self.current_position = position
                 self.current_goal = self.goal
 
-                if not (-1.5 <= x <= 1.5 and -1.5 <= y <= 1.5):
+                # Geschwindigkeit berechnen
+                if prev_x is not None:
+                    dx = x - prev_x
+                    dy = y - prev_y
+                    dt = timestamp - prev_time
+                    speed_calculated = np.sqrt(dx ** 2 + dy ** 2) / dt if dt > 0 else 0.0
+                else:
+                    speed_calculated = 0.0
+                prev_x, prev_y, prev_time = x, y, timestamp
+
+                # Spielfeldbegrenzung prüfen
+                if not (FIELD_X_LIMITS[0] <= x <= FIELD_X_LIMITS[1] and FIELD_Y_LIMITS[0] <= y <= FIELD_Y_LIMITS[1]):
                     print("\n⛔ Spielfeld verlassen – Rueckfuehrung aktiviert.")
                     self.paused = True
                     self.state = "orienting"
                     self.goal_reached_time = None
                     self.hold_timer_active = False
 
+                # Rückführlogik
                 if self.paused:
                     dx = self.return_goal[0] - x
                     dy = self.return_goal[1] - y
@@ -213,28 +242,27 @@ class Client:
                     print(f"\r[RUECKFUEHRUNG] Pos: ({x:.2f},{y:.2f}) → Rueckkehr", end="")
                     continue
 
+                # RL-Zustand
                 dx, dy = self.goal[0] - x, self.goal[1] - y
                 dist = np.linalg.norm([dx, dy])
                 car_angle = (-yaw - 150) % 360
                 goal_angle = np.degrees(np.arctan2(dy, dx)) % 360
                 angle_diff = (goal_angle - car_angle + 180) % 360 - 180
 
-                # Normalisierung
                 yaw_norm = yaw / 180.0
                 angle_diff_norm = angle_diff / 180.0
                 state = np.array([self.goal[0], self.goal[1], x, y, yaw_norm, dist, angle_diff_norm], dtype=np.float32)
                 obs_tensor = torch.tensor(state).unsqueeze(0).to(DEVICE)
 
-                with torch.no_grad():
-                    noise = max(0.05, self.exploration_noise * np.exp(-self.episode / 200))
-                    if len(self.buffer) < BATCH_SIZE:
-                        action = np.random.uniform(-1, 1, size=2)
-                    else:
+                # Aktion wählen
+                if len(self.buffer) < BATCH_SIZE:
+                    action = np.random.uniform(-1, 1, size=2)
+                else:
+                    with torch.no_grad():
                         action = self.actor(obs_tensor).cpu().numpy()[0]
-                        action = np.clip(action + np.random.normal(0, noise, size=2), -1.0, 1.0)
-
-                if len(self.buffer) >= BATCH_SIZE:
-                    self.train_step()
+                        noise = max(0.05, 0.2 * np.exp(-self.episode / 300))
+                        action += np.random.normal(0, noise, size=2)
+                        action = np.clip(action, -1.0, 1.0)
 
                 speed, steering = action
                 reward, current_dist = compute_reward(position, self.goal, self.prev_dist, speed, steering)
@@ -244,54 +272,72 @@ class Client:
 
                 if self.prev_obs is not None:
                     self.buffer.push((self.prev_obs, action, reward, next_state, float(done)))
+
                 self.prev_obs = next_state
+                self.prev_reward = reward
 
-                if (time.time() - self.goal_start_time) > 45:
-                    print("\n⏱️ Zeitlimit ueberschritten – Rueckfuehrung aktiviert.")
-                    self.paused = True
-                    self.state = "orienting"
-                    self.goal_reached_time = None
-                    self.hold_timer_active = False
-                    continue
+                # Logging
+                self.raw_data_log.append({
+                    "timestamp": timestamp,
+                    "episode": self.episode,
+                    "position": {"x": x, "y": y},
+                    "yaw": yaw,
+                    "goal": {"x": float(self.goal[0]), "y": float(self.goal[1])},
+                    "speed_calculated": speed_calculated,
+                    "paused": self.paused,
+                    "action": {"speed": float(speed), "steering": float(steering)},
+                    "reward": float(reward),
+                    "critic_loss": float(self.loss_log[-1]["critic_loss"]) if self.loss_log else None,
+                    "actor_loss": float(self.loss_log[-1]["actor_loss"]) if self.loss_log else None
+                })
 
-                at_goal = current_dist < 0.2
-                almost_still = abs(speed) < 1
+                # Training
+                if self.iteration % TRAIN_INTERVAL == 0 and len(self.buffer) >= BATCH_SIZE:
+                    self.train_step()
 
-                if at_goal and almost_still:
-                    if not self.hold_timer_active:
+                self.send_speed_message(speed, steering)
+
+                # Ziel erreicht
+                if done:
+                    if self.goal_reached_time is None:
                         self.goal_reached_time = time.time()
                         self.hold_timer_active = True
                     elif time.time() - self.goal_reached_time >= 0.5:
-                        print("\n✅ Ziel erfolgreich erreicht und gehalten – neues Ziel.")
+                        print("\n✅ Ziel erreicht und gehalten.")
+                        reward, _ = compute_reward(position, self.goal, self.prev_dist, 0.0, 0.0, holding=True)
+                        self.buffer.push((self.prev_obs, [0.0, 0.0], reward, next_state, 1.0))
+                        self.save_raw_data()
+                        self.raw_data_log = []
+                        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        self.data_log_filename = f"plot_results/measurement_data/episode_{self.episode}_{timestamp_str}.json"
                         self.goal = self._sample_goal()
                         self.prev_obs = None
                         self.prev_dist = None
-                        self.goal_start_time = time.time()
+                        self.episode += 1
                         self.goal_reached_time = None
                         self.hold_timer_active = False
-                        self.episode += 1
-                        save_models(self.actor, self.critic, self.episode)
+                        self.save_models()
+                        continue
+                    else:
+                        self.send_speed_message(0.0, 0.0)
+                        reward, _ = compute_reward(position, self.goal, self.prev_dist, 0.0, 0.0, holding=True)
+                        self.buffer.push((self.prev_obs, [0.0, 0.0], reward, next_state, 0.0))
+                        time.sleep(0.005)
+                        continue
                 else:
                     self.goal_reached_time = None
                     self.hold_timer_active = False
 
-                if len(self.buffer) >= 100:
-                    self.train_step()
-
-                self.send_speed_message(speed, steering)
-                print(
-                    f"\rEp: {self.episode} | Pos: ({x:.2f},{y:.2f}) | Goal: {self.goal} | R: {reward:.2f} | a: [{speed:.2f}, {steering:.2f}]",
-                    end="")
-                time.sleep(0.02)
+                self.iteration += 1
+                time.sleep(0.005)
 
         except KeyboardInterrupt:
             print("\n🛑 Stoppe...")
             self.sock.close()
+            self.save_logs()
+            self.save_raw_data()
 
     def train_step(self):
-        if len(self.buffer) < BATCH_SIZE:
-            return  # Sicherheitsabbruch
-
         s, a, r, s2, d = self.buffer.sample(BATCH_SIZE)
         with torch.no_grad():
             a2 = self.actor_target(s2)
@@ -312,29 +358,80 @@ class Client:
         for tp, p in zip(self.critic_target.parameters(), self.critic.parameters()):
             tp.data.copy_(TAU * p.data + (1 - TAU) * tp.data)
 
+        self.loss_log.append({
+            "episode": self.episode,
+            "critic_loss": critic_loss.item(),
+            "actor_loss": actor_loss.item(),
+            "reward": self.prev_reward
+        })
 
+    def save_raw_data(self):
+        with open(self.data_log_filename, "w") as f:
+            json.dump(self.raw_data_log, f, indent=2)
+            print(f"📁 Bewegungsdaten gespeichert unter: {self.data_log_filename}")
 # === Visualisierung ===
 def start_live_plot(client_instance):
-    fig, ax = plt.subplots()
-    ax.set_xlim(-2, 2)
-    ax.set_ylim(-2, 2)
-    goal_dot, = ax.plot([], [], 'ro', label='Ziel')
-    car_dot, = ax.plot([], [], 'bo', label='Auto')
-    ax.legend()
-    ax.grid(True)
-    plt.title("Live Position vs. Zielpunkt")
-    plt.xlabel("x [m]")
-    plt.ylabel("y [m]")
+    fig, axs = plt.subplots(2, 2, figsize=(12, 8))
+    ax_pos = axs[0, 0]
+    ax_critic = axs[0, 1]
+    ax_actor = axs[1, 0]
+    ax_reward = axs[1, 1]
 
-    def update_plot(frame):
+    # Spielfeldgrenzen setzen
+    ax_pos.set_xlim(FIELD_X_LIMITS[0] - 0.2, FIELD_X_LIMITS[1] + 0.2)
+    ax_pos.set_ylim(FIELD_Y_LIMITS[0] - 0.2, FIELD_Y_LIMITS[1] + 0.2)
+    ax_pos.set_title("Live Position")
+    ax_pos.set_xlabel("x [m]")
+    ax_pos.set_ylabel("y [m]")
+    ax_pos.grid(True)
+
+    # Spielfeldgrenze einzeichnen
+    border_x = [FIELD_X_LIMITS[0], FIELD_X_LIMITS[1], FIELD_X_LIMITS[1], FIELD_X_LIMITS[0], FIELD_X_LIMITS[0]]
+    border_y = [FIELD_Y_LIMITS[0], FIELD_Y_LIMITS[0], FIELD_Y_LIMITS[1], FIELD_Y_LIMITS[1], FIELD_Y_LIMITS[0]]
+    ax_pos.plot(border_x, border_y, 'k--', linewidth=1.2, label='Spielfeldgrenze')
+
+    goal_dot, = ax_pos.plot([], [], 'ro', label='Ziel')
+    car_dot, = ax_pos.plot([], [], 'bo', label='Auto')
+    ax_pos.legend()
+
+    critic_line, = ax_critic.plot([], [], label='Critic Loss', color='blue')
+    actor_line, = ax_actor.plot([], [], label='Actor Loss', color='green')
+    reward_line, = ax_reward.plot([], [], label='Reward', color='red')
+
+    for ax in [ax_critic, ax_actor, ax_reward]:
+        ax.set_xlabel("Episode")
+        ax.grid(True)
+        ax.legend()
+
+    ax_critic.set_title("Critic Loss")
+    ax_actor.set_title("Actor Loss")
+    ax_reward.set_title("Episodischer Reward")
+
+    def update(frame):
         pos = client_instance.current_position
         goal = client_instance.current_goal
+
         if pos is not None and goal is not None:
             car_dot.set_data([float(pos[0])], [float(pos[1])])
             goal_dot.set_data([float(goal[0])], [float(goal[1])])
-        return car_dot, goal_dot
 
-    ani = animation.FuncAnimation(fig, update_plot, interval=100, cache_frame_data=False)
+        episodes = [entry["episode"] for entry in client_instance.loss_log]
+        critic_losses = [entry["critic_loss"] for entry in client_instance.loss_log]
+        actor_losses = [entry["actor_loss"] for entry in client_instance.loss_log]
+        rewards = [entry["reward"] for entry in client_instance.loss_log]
+
+        critic_line.set_data(episodes, critic_losses)
+        actor_line.set_data(episodes, actor_losses)
+        reward_line.set_data(episodes, rewards)
+
+        for ax in [ax_critic, ax_actor, ax_reward]:
+            ax.relim()
+            ax.autoscale_view()
+
+        return car_dot, goal_dot, critic_line, actor_line, reward_line
+
+    ani = animation.FuncAnimation(fig, update, interval=500, cache_frame_data=False)
+    plt.tight_layout()
     plt.show()
 
 # === Main ===
@@ -343,3 +440,4 @@ if __name__ == "__main__":
     thread = threading.Thread(target=client.send_loop, daemon=True)
     thread.start()
     start_live_plot(client)
+
