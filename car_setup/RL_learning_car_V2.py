@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+from fontTools.merge import timer
+
 import triad_openvr
 import time
 import json
@@ -15,6 +17,7 @@ import matplotlib.animation as animation
 import threading
 import os
 from datetime import datetime
+import pickle
 
 # === Hyperparameter ===
 LR_ACTOR = 1e-4
@@ -25,8 +28,9 @@ BUFFER_SIZE = 1_000_000
 BATCH_SIZE = 256
 TRAIN_INTERVAL = 10
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-FIELD_X_LIMITS = (-1.5, 1.5)
+FIELD_X_LIMITS = (-1.2, 1.2)
 FIELD_Y_LIMITS = (-1.5, 1.5)
+no_move_start_time = None
 
 # === Modelle ===
 class Actor(nn.Module):
@@ -71,11 +75,22 @@ class ReplayBuffer:
             torch.tensor(d, dtype=torch.float32).unsqueeze(1).to(DEVICE)
         )
 
+    def save(self, filepath):
+        with open(filepath, 'wb') as f:
+            pickle.dump(self.buffer, f)
+        print(f"💾 ReplayBuffer gespeichert unter {filepath}")
+
+    def load(self, filepath):
+        if os.path.exists(filepath):
+            with open(filepath, 'rb') as f:
+                self.buffer = pickle.load(f)
+            print(f"📂 ReplayBuffer geladen von {filepath}")
     def __len__(self):
         return len(self.buffer)
 
 # === Reward-Funktion ===
 def compute_reward(position, goal, prev_dist, speed, steering, holding=False):
+    global no_move_start_time
     dist = np.linalg.norm(goal - position)
     reward = 0.0
 
@@ -83,24 +98,37 @@ def compute_reward(position, goal, prev_dist, speed, steering, holding=False):
         print('in holding')
         reward += 100
 
+
     reward += 3 /dist
-    reward -= abs(position[0]) * 3
-    reward -= abs(position[1]) * 3
-    if dist > 0.3 and abs(speed) < 0.7:
-        reward -= 5.0
+    reward -= abs(position[0]) * 2
+    reward -= abs(position[1]) * 2
+#    if dist > 0.3 and abs(speed) < 0.7:
+#        reward -= 1
     if prev_dist is not None:
         progress = prev_dist - dist
         reward += progress * 5.0 / dist
-        if progress < 0:
-            reward -= 2.0
-    if dist < 0.3 and abs(speed) < 0.1 and abs(steering) < 0.1:
-        reward += 10.0
-    if speed < -0.1:
-        reward -= 2.0
-    if abs(speed) < 0.05 and dist > 0.5:
-        reward -= 1.0
-    if abs(steering) > 0.9:
-        reward -= abs(steering)
+
+        if abs(progress) > 0.01:
+            # Fortschritt gemacht → Timer zurücksetzen
+            no_move_start_time = None
+            if progress < -0.1:
+                reward -= progress * 10.0 * dist
+        else:
+            # Kein Fortschritt → Timer starten falls nicht aktiv
+            if no_move_start_time is None:
+                no_move_start_time = time.time()
+
+    # Langzeit-Strafe nach 10 Sekunden Stillstand
+    if no_move_start_time is not None:
+        still_time = time.time() - no_move_start_time
+        if still_time > 10:
+            penalty = min((still_time - 10) * 0.1, 10.0)
+            reward -= penalty
+#    if dist < 0.3 and abs(speed) < 0.1 and abs(steering) < 0.1:
+#        reward += 10.0
+#    if abs(steering) > 0.9:
+#        reward -= abs(steering)
+
 
     return np.clip(reward, -10.0, 10.0), dist
 
@@ -112,10 +140,10 @@ class Client:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect((host, port))
 
-        self.actor = Actor(7, 2).to(DEVICE)
-        self.critic = Critic(7, 2).to(DEVICE)
-        self.actor_target = Actor(7, 2).to(DEVICE)
-        self.critic_target = Critic(7, 2).to(DEVICE)
+        self.actor = Actor(5, 2).to(DEVICE)
+        self.critic = Critic(5, 2).to(DEVICE)
+        self.actor_target = Actor(5, 2).to(DEVICE)
+        self.critic_target = Critic(5, 2).to(DEVICE)
         self.actor_target.load_state_dict(self.actor.state_dict())
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.actor_optim = optim.Adam(self.actor.parameters(), lr=LR_ACTOR)
@@ -138,13 +166,28 @@ class Client:
         self.prev_speed_sign = 0
         self.in_neutral_phase = False
         self.neutral_count = 0
+        # self.load_models()
 
         self.raw_data_log = []
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.data_log_filename = f"plot_results/measurement_data/episode_{self.episode}_{timestamp_str}.json"
         os.makedirs(os.path.dirname(self.data_log_filename), exist_ok=True)
 
+        self.buffer = ReplayBuffer(BUFFER_SIZE)
+        self.replay_path = "models/replay_buffer.pkl"
+        # self.buffer.load(self.replay_path)
+
         self.out_of_bounds_handled = False
+
+    def load_models(self):
+        actor_path = "models/actor_latest.pt"
+        critic_path = "models/critic_latest.pt"
+        if os.path.exists(actor_path) and os.path.exists(critic_path):
+            self.actor.load_state_dict(torch.load(actor_path))
+            self.critic.load_state_dict(torch.load(critic_path))
+            self.actor_target.load_state_dict(self.actor.state_dict())
+            self.critic_target.load_state_dict(self.critic.state_dict())
+            print("📥 Modelle geladen (fortlaufendes Training).")
 
     def _sample_goal(self):
         while True:
@@ -156,6 +199,8 @@ class Client:
         os.makedirs("models", exist_ok=True)
         torch.save(self.actor.state_dict(), f"models/actor_ep{self.episode}.pt")
         torch.save(self.critic.state_dict(), f"models/critic_ep{self.episode}.pt")
+        torch.save(self.actor.state_dict(), "models/actor_latest.pt")
+        torch.save(self.critic.state_dict(), "models/critic_latest.pt")
         print("💾 Modelle gespeichert.")
 
     def save_logs(self):
@@ -172,7 +217,7 @@ class Client:
             self.neutral_count = 0
             self.prev_speed_sign = current_sign
         if self.in_neutral_phase:
-            if self.neutral_count < 4:
+            if self.neutral_count < 7:
                 neutral = json.dumps({"speed": 0.0, "steering": 0.0}) + "\n"
                 self.sock.sendall(neutral.encode())
                 self.neutral_count += 1
@@ -186,12 +231,13 @@ class Client:
     def send_loop(self):
         try:
             self.goal_start_time = time.time()
+            self.timer_no_move = time.time()
             self.goal_reached_time = None
             self.hold_timer_active = False
             prev_x = prev_y = prev_time = None
 
             while True:
-                pose = self.vr.devices["tracker_2"].get_pose_euler()
+                pose = self.vr.devices["tracker_1"].get_pose_euler()
                 x, y, yaw = pose[0], pose[1], pose[3]
                 timestamp = time.time()
                 position = np.array([x, y])
@@ -288,7 +334,7 @@ class Client:
 
                 yaw_norm = yaw / 180.0
                 angle_diff_norm = angle_diff / 180.0
-                state = np.array([self.goal[0], self.goal[1], x, y, yaw_norm, dist, angle_diff_norm], dtype=np.float32)
+                state = np.array([self.goal[0], self.goal[1], x, y, yaw_norm], dtype=np.float32)
                 obs_tensor = torch.tensor(state).unsqueeze(0).to(DEVICE)
 
                 # Aktion wählen
@@ -416,6 +462,7 @@ class Client:
     def save_raw_data(self):
         with open(self.data_log_filename, "w") as f:
             json.dump(self.raw_data_log, f, indent=2)
+            self.buffer.save(self.replay_path)
             print(f"📁 Bewegungsdaten gespeichert unter: {self.data_log_filename}")
 # === Visualisierung ===
 def start_live_plot(client_instance):
