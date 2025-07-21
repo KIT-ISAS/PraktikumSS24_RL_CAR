@@ -1,10 +1,10 @@
 # === DDPG Reinforcement Learning Agent für Autonomes Fahrzeug mit wissenschaftlichem Logging und Rückführung ===
 
+# === Imports ===
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from fontTools.merge import timer
 
 import triad_openvr
 import time
@@ -28,11 +28,22 @@ BUFFER_SIZE = 1_000_000
 BATCH_SIZE = 256
 TRAIN_INTERVAL = 10
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# === Spielfeldgrenzen ===
 FIELD_X_LIMITS = (-1.2, 1.2)
 FIELD_Y_LIMITS = (-1.5, 1.5)
-no_move_start_time = None
 
-# === Modelle ===
+# === Totzone für Geschwindigkeit ===
+SPEED_THRESHOLD = 0.7
+
+# === Neutrale Startwerte für globale Reward-Logik ===
+no_move_start_time = None
+prev_speed_sign = 0
+steering_hold_counter = 0
+prev_steering = 0.0
+v_switch_counter = 0
+
+# === Actor-Netzwerk ===
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim):
         super().__init__()
@@ -45,6 +56,7 @@ class Actor(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+# === Critic-Netzwerk ===
 class Critic(nn.Module):
     def __init__(self, state_dim, action_dim):
         super().__init__()
@@ -57,6 +69,7 @@ class Critic(nn.Module):
     def forward(self, s, a):
         return self.net(torch.cat([s, a], dim=1))
 
+# === Replay Buffer ===
 class ReplayBuffer:
     def __init__(self, capacity):
         self.buffer = deque(maxlen=capacity)
@@ -85,99 +98,149 @@ class ReplayBuffer:
             with open(filepath, 'rb') as f:
                 self.buffer = pickle.load(f)
             print(f"📂 ReplayBuffer geladen von {filepath}")
+
     def __len__(self):
         return len(self.buffer)
 
 # === Reward-Funktion ===
 def compute_reward(position, goal, prev_dist, speed, steering, holding=False):
-    global no_move_start_time
-    dist = np.linalg.norm(goal - position)
+    global no_move_start_time, steering_hold_counter, prev_steering
+    global prev_speed_sign, v_switch_counter
+
     reward = 0.0
+    dist = np.linalg.norm(goal - position)
 
-    if holding == True:
-        print('in holding')
-        reward += 100
+    # === 1. Ziel erreicht und gehalten ===
+    if holding:
+        return 20.0, dist
 
+    # === 2. Annäherung ans Ziel ===
+    reward += 3.0 / max(dist, 0.1)
 
-    reward += 3 /dist
-    reward -= abs(position[0]) * 2
-    reward -= abs(position[1]) * 2
-#    if dist > 0.3 and abs(speed) < 0.7:
-#        reward -= 1
+    # === 3. Spielfeldbegrenzung ===
+    if not (FIELD_X_LIMITS[0] <= position[0] <= FIELD_X_LIMITS[1] and
+            FIELD_Y_LIMITS[0] <= position[1] <= FIELD_Y_LIMITS[1]):
+        return -20.0, dist
+
+    # === 4. Fortschritt zur Zielposition ===
     if prev_dist is not None:
         progress = prev_dist - dist
-        reward += progress * 5.0 / dist
+        reward += progress * 5.0 / max(dist, 0.1)
 
         if abs(progress) > 0.01:
-            # Fortschritt gemacht → Timer zurücksetzen
             no_move_start_time = None
             if progress < -0.1:
-                reward -= progress * 10.0 * dist
+                reward -= abs(progress) * 5.0
         else:
-            # Kein Fortschritt → Timer starten falls nicht aktiv
             if no_move_start_time is None:
                 no_move_start_time = time.time()
 
-    # Langzeit-Strafe nach 10 Sekunden Stillstand
+    # === 5. Langsames oder kein Fortschritt ===
     if no_move_start_time is not None:
         still_time = time.time() - no_move_start_time
         if still_time > 10:
-            penalty = min((still_time - 10) * 0.1, 10.0)
-            reward -= penalty
-#    if dist < 0.3 and abs(speed) < 0.1 and abs(steering) < 0.1:
-#        reward += 10.0
-#    if abs(steering) > 0.9:
-#        reward -= abs(steering)
+            reward -= min((still_time - 10) * 0.1, 5.0)
 
+    # === 6. Totzone bestrafen ===
+    if dist > 0.3 and abs(speed) < 0.7:
+        reward -= 1.0
 
-    return np.clip(reward, -10.0, 10.0), dist
+    # === 7. Moderate Geschwindigkeit belohnen ===
+    if abs(speed) >= 0.7:
+        reward += 0.5
+
+    # === 8. Richtungswechsel kontrollieren ===
+    current_sign = np.sign(speed)
+    if current_sign != 0 and current_sign != prev_speed_sign:
+        v_switch_counter += 1
+        reward -= min(2.0 * v_switch_counter, 5.0)
+        prev_speed_sign = current_sign
+    else:
+        v_switch_counter = max(0, v_switch_counter - 1)
+
+    # === 9. Circling erkennen durch konstantes Lenken ===
+    if abs(steering - prev_steering) < 0.01:
+        steering_hold_counter += 1
+    else:
+        steering_hold_counter = 0
+
+    if steering_hold_counter > 30:
+        reward -= 2.0 + (steering_hold_counter - 30) * 0.1
+
+    prev_steering = steering
+
+    # === 10. Reward Clipping ===
+    reward = np.clip(reward, -20.0, 20.0)
+    return reward, dist
+
+def reset_reward_tracking():
+    global steering_hold_counter, prev_steering, v_switch_counter, prev_speed_sign
+    steering_hold_counter = 0
+    prev_steering = 0.0
+    v_switch_counter = 0
+    prev_speed_sign = 0
+
 
 # === Platzhalter für Client-Klasse ===
 class Client:
     def __init__(self, host="192.168.137.5", port=12345):
+        # === Verbindung & Sensoren ===
         self.vr = triad_openvr.triad_openvr()
         self.vr.print_discovered_objects()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect((host, port))
 
+        # === Netzwerke ===
         self.actor = Actor(5, 2).to(DEVICE)
         self.critic = Critic(5, 2).to(DEVICE)
         self.actor_target = Actor(5, 2).to(DEVICE)
         self.critic_target = Critic(5, 2).to(DEVICE)
         self.actor_target.load_state_dict(self.actor.state_dict())
         self.critic_target.load_state_dict(self.critic.state_dict())
+
         self.actor_optim = optim.Adam(self.actor.parameters(), lr=LR_ACTOR)
         self.critic_optim = optim.Adam(self.critic.parameters(), lr=LR_CRITIC)
 
+        # === Erfahrungsspeicher ===
         self.buffer = ReplayBuffer(BUFFER_SIZE)
+        self.replay_path = "models/replay_buffer.pkl"
+
+        # === Trainingsstatus ===
         self.episode = 0
         self.iteration = 0
         self.loss_log = []
-        self.prev_obs = None
-        self.prev_dist = None
+        self.prev_reward = 0.0
+
+        # === Zustände und Navigation ===
         self.goal = self._sample_goal()
         self.return_goal = np.array([0.0, 0.0])
+        self.current_goal = self.goal
+        self.current_position = np.array([0.0, 0.0])
+
+        self.prev_obs = None
+        self.prev_dist = None
         self.paused = False
         self.state = "orienting"
-        self.prev_reward = 0.0
-        self.current_position = np.array([0.0, 0.0])
-        self.current_goal = self.goal
+        self.goal_reached_time = None
+        self.hold_timer_active = False
+        self.out_of_bounds_handled = False
 
+        # === Bewegung / Richtungswechsel ===
         self.prev_speed_sign = 0
         self.in_neutral_phase = False
         self.neutral_count = 0
-        # self.load_models()
 
-        self.raw_data_log = []
+        # === Logging & Verzeichnisstruktur ===
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.data_log_filename = f"plot_results/measurement_data/episode_{self.episode}_{timestamp_str}.json"
         os.makedirs(os.path.dirname(self.data_log_filename), exist_ok=True)
+        self.raw_data_log = []
 
-        self.buffer = ReplayBuffer(BUFFER_SIZE)
-        self.replay_path = "models/replay_buffer.pkl"
-        # self.buffer.load(self.replay_path)
-
-        self.out_of_bounds_handled = False
+    def _sample_goal(self):
+        while True:
+            g = np.random.uniform(-1.0, 1.0, size=2)
+            if np.linalg.norm(g) > 0.5:
+                return g
 
     def load_models(self):
         actor_path = "models/actor_latest.pt"
@@ -188,12 +251,6 @@ class Client:
             self.actor_target.load_state_dict(self.actor.state_dict())
             self.critic_target.load_state_dict(self.critic.state_dict())
             print("📥 Modelle geladen (fortlaufendes Training).")
-
-    def _sample_goal(self):
-        while True:
-            g = np.random.uniform(-1.0, 1.0, size=2)
-            if np.linalg.norm(g) > 0.5:
-                return g
 
     def save_models(self):
         os.makedirs("models", exist_ok=True)
@@ -294,6 +351,7 @@ class Client:
 
                 # Rückführlogik
                 if self.paused:
+                    reset_reward_tracking()
                     dx = self.return_goal[0] - x
                     dy = self.return_goal[1] - y
                     distance = np.linalg.norm([dx, dy])
@@ -421,7 +479,7 @@ class Client:
                     self.goal_reached_time = None
                     self.hold_timer_active = False
 
-                self.iteration += 1
+                reset_reward_tracking()
                 time.sleep(0.005)
 
         except KeyboardInterrupt:
