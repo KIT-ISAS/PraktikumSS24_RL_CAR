@@ -34,7 +34,7 @@ FIELD_X_LIMITS = (-1.2, 1.2)
 FIELD_Y_LIMITS = (-1.5, 1.5)
 
 # === Totzone für Geschwindigkeit ===
-SPEED_THRESHOLD = 0.7
+SPEED_THRESHOLD = 0.85
 
 # === Neutrale Startwerte für globale Reward-Logik ===
 no_move_start_time = None
@@ -103,7 +103,7 @@ class ReplayBuffer:
         return len(self.buffer)
 
 # === Reward-Funktion ===
-def compute_reward(position, goal, prev_dist, speed, steering, holding=False):
+def compute_reward(position, goal, prev_dist, speed, steering, yaw, holding=False):
     global no_move_start_time, steering_hold_counter, prev_steering
     global prev_speed_sign, v_switch_counter
 
@@ -127,7 +127,7 @@ def compute_reward(position, goal, prev_dist, speed, steering, holding=False):
         progress = prev_dist - dist
         reward += progress * 5.0 / max(dist, 0.1)
 
-        if abs(progress) > 0.01:
+        if abs(progress) > 0.03:
             no_move_start_time = None
             if progress < -0.1:
                 reward -= abs(progress) * 5.0
@@ -138,16 +138,12 @@ def compute_reward(position, goal, prev_dist, speed, steering, holding=False):
     # === 5. Langsames oder kein Fortschritt ===
     if no_move_start_time is not None:
         still_time = time.time() - no_move_start_time
-        if still_time > 10:
-            reward -= min((still_time - 10) * 0.1, 5.0)
+        if still_time > 2:
+            reward -= min((still_time - 20) * 0.1, 20.0)
 
     # === 6. Totzone bestrafen ===
-    if dist > 0.3 and abs(speed) < 0.7:
-        reward -= 1.0
-
-    # === 7. Moderate Geschwindigkeit belohnen ===
-    if abs(speed) >= 0.7:
-        reward += 0.5
+    if dist > 0.3 and abs(speed) < 0.55:
+        reward -= 5.0
 
     # === 8. Richtungswechsel kontrollieren ===
     current_sign = np.sign(speed)
@@ -159,7 +155,7 @@ def compute_reward(position, goal, prev_dist, speed, steering, holding=False):
         v_switch_counter = max(0, v_switch_counter - 1)
 
     # === 9. Circling erkennen durch konstantes Lenken ===
-    if abs(steering - prev_steering) < 0.01:
+    if abs(steering - prev_steering) < 0.2:
         steering_hold_counter += 1
     else:
         steering_hold_counter = 0
@@ -172,6 +168,18 @@ def compute_reward(position, goal, prev_dist, speed, steering, holding=False):
     # === 10. Reward Clipping ===
     reward = np.clip(reward, -20.0, 20.0)
     return reward, dist
+
+    # === 11. Ausrichtung zum Zielpunkt belohnen ===
+    to_goal = goal - position
+    to_goal_angle = np.arctan2(to_goal[1], to_goal[0])
+
+    # Winkel zwischen Fahrtrichtung (yaw) und Richtung zum Ziel
+    angle_diff = np.arctan2(np.sin(to_goal_angle - yaw), np.cos(to_goal_angle - yaw))  # [-pi, pi]
+    angle_diff_deg = np.degrees(abs(angle_diff))  # Optional: in Grad, zur besseren Skalierung
+
+    # Je kleiner der Winkel, desto höher der Bonus (max +3, min 0)
+    orientation_reward = max(0.0, 3.0 * (1 - angle_diff_deg / 180))
+    reward += orientation_reward
 
 def reset_reward_tracking():
     global steering_hold_counter, prev_steering, v_switch_counter, prev_speed_sign
@@ -317,7 +325,7 @@ class Client:
                         FIELD_X_LIMITS[0] <= x <= FIELD_X_LIMITS[1] and FIELD_Y_LIMITS[0] <= y <= FIELD_Y_LIMITS[1]
                 ):
                     print("\n⛔ Spielfeld verlassen – Bestrafung + Rückführung aktiviert.")
-                    reward, _ = compute_reward(position, self.goal, self.prev_dist, speed_calculated, steering, holding=False)
+                    reward, _ = compute_reward(position, self.goal, self.prev_dist, speed_calculated, steering, yaw, holding=False)
                     done = True
                     next_state = self.prev_obs if self.prev_obs is not None else state
 
@@ -375,7 +383,7 @@ class Client:
                                 speed = 0.95
                                 steering = 0.0
                             else:
-                                speed = 0.85
+                                speed = 1
                                 damb = angle_diff / 180.0
                                 steering = -damb * 3
 
@@ -406,7 +414,7 @@ class Client:
                         action = np.clip(action, -1.0, 1.0)
 
                 speed, steering = action
-                reward, current_dist = compute_reward(position, self.goal, self.prev_dist, speed, steering)
+                reward, current_dist = compute_reward(position, self.goal, self.prev_dist, speed, steering, yaw)
                 self.prev_dist = current_dist
                 next_state = state.copy()
                 done = current_dist < 0.2
@@ -471,7 +479,7 @@ class Client:
                         continue
                     else:
                         self.send_speed_message(0.0, 0.0)
-                        reward, _ = compute_reward(position, self.goal, self.prev_dist, 0.0, 0.0, holding=True)
+                        reward, _ = compute_reward(position, self.goal, self.prev_dist, 0.0, 0.0, yaw, holding=True)
                         self.buffer.push((self.prev_obs, [0.0, 0.0], reward, next_state, 0.0))
                         time.sleep(0.005)
                         continue
